@@ -1,4 +1,4 @@
-"""Bot đồng bộ 50 tin nhắn (giữ lại tin đã xóa), hình ảnh/video và theo dõi biến động Role mỗi 5s."""
+"""Bot đồng bộ 50 tin nhắn gần nhất, hình ảnh/video, theo dõi role và tự làm trống state.json sau khi chạy."""
 import asyncio
 import io
 import json
@@ -81,7 +81,6 @@ def render_message(payload, source_id, fallback_links=None, deleted=False):
 
 
 async def prepare_attachments(msg, max_bytes):
-    """Tải hình ảnh, video và tệp đính kèm để upload trực tiếp sang server đích."""
     files = []
     fallback_links = []
     for a in msg.attachments:
@@ -226,7 +225,6 @@ class Mirror(discord.Client):
                 return
             roster = self.state.setdefault("roster", {"pages": []})
 
-            # 1. Đảm bảo kênh #danh-sach-role và #update-role tồn tại
             channel = target.get_channel(roster.get("channel_id", 0))
             if channel is None:
                 channel = await target.create_text_channel(
@@ -237,7 +235,6 @@ class Mirror(discord.Client):
 
             log_channel = await self.get_role_log_channel(target)
 
-            # 2. Cập nhật bảng tổng hợp #danh-sach-role
             pages = role_pages(source)
             for index, text in enumerate(pages):
                 old = roster["pages"][index] if index < len(roster["pages"]) else None
@@ -267,7 +264,6 @@ class Mirror(discord.Client):
                 roster["pages"].pop()
                 self.save()
 
-            # 3. Kiểm tra ai được thêm role hoặc mất role để báo vào #update-role
             old_members = {m["id"]: m for m in roster.get("members", [])}
             snapshot = []
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -286,7 +282,6 @@ class Mirror(discord.Client):
                     "roles": roles_data,
                 })
 
-                # Nếu đã có dữ liệu từ lần quét trước thì so sánh sự thay đổi
                 if old_members and member.id in old_members:
                     old_r = {
                         r["id"]: r["name"]
@@ -345,7 +340,6 @@ class Mirror(discord.Client):
         return dst, record
 
     async def mark_message_deleted(self, src_cid, mid):
-        """Sửa tin nhắn ở server đích thành [ĐÃ XÓA] khi bị xóa ở server nguồn."""
         record = self.state["channels"].get(str(src_cid))
         if not record:
             return
@@ -380,13 +374,11 @@ class Mirror(discord.Client):
         mapping = record["messages"]
         max_bytes = getattr(dst.guild, "filesize_limit", 25 * 1024 * 1024)
 
-        # Tin nhắn cổ nhất trong 50 tin hiện tại của kênh nguồn
         oldest_recent_id = min((m.id for m in recent), default=0)
 
         for mid in list(mapping):
             if mid not in keep:
                 item = mapping[mid]
-                # Nếu tin nhắn có ID lớn hơn tin thứ 50 (tức là tin mới bị thành viên xóa ở nguồn) -> Sửa thành [ĐÃ XÓA]
                 if int(mid) > oldest_recent_id:
                     if not item.get("deleted"):
                         item["deleted"] = True
@@ -403,7 +395,6 @@ class Mirror(discord.Client):
                             mapping.pop(mid, None)
                         self.save()
                 else:
-                    # Nếu tin nhắn đã cũ và trôi ra ngoài mốc 50 tin gần nhất -> Xóa cuốn chiếu để giữ đúng 50 tin
                     try:
                         await dst.get_partial_message(item["id"]).delete()
                         await asyncio.sleep(0.6)
@@ -412,7 +403,6 @@ class Mirror(discord.Client):
                     mapping.pop(mid, None)
                     self.save()
 
-        # Duyệt từ tin cũ đến tin mới trong phạm vi 50 tin nhắn gần nhất
         for msg in reversed(recent):
             mid = str(msg.id)
             payload = message_payload(msg)
@@ -449,6 +439,11 @@ class Mirror(discord.Client):
             self.save()
             await asyncio.sleep(0.3)
 
+        # Làm trống file state.json sau khi đồng bộ xong kênh này
+        self.state = {}
+        self.save()
+        LOG.info("Đã đồng bộ xong 50 tin cho kênh %s và làm trống state.json.", src.name)
+
     async def sync_voice(self, src, dst, record):
         lines = [f"@{m.name} · {m.display_name}" for m in sorted(src.members, key=lambda m: m.id)]
         full = f"Room thoại: {src.name}\nNhững người đang ngồi ({len(lines)}):\n" + (
@@ -474,7 +469,6 @@ class Mirror(discord.Client):
 
     @tasks.loop(seconds=5)
     async def role_worker(self):
-        """Vòng lặp cập nhật vai trò và kiểm tra thêm/mất role mỗi 5 giây."""
         if not self.enabled or not self.is_ready():
             return
         if not self.cfg.get("sync_roles"):
@@ -522,18 +516,15 @@ class Mirror(discord.Client):
         await self.wait_until_ready()
 
     async def on_interaction(self, interaction):
-        """Chặn hoàn toàn mọi tương tác Slash Command (/help, v.v.), không bao giờ phản hồi."""
         return
 
     async def on_message(self, message):
-        """Không xử lý bất kỳ lệnh tiền tố nào (!help, +help, v.v.), chỉ ghi nhận có tin nhắn mới."""
         if not message.guild or message.guild.id != self.cfg["source_guild_id"]:
             return
         if message.channel.id in self.selected:
             self.dirty.add(message.channel.id)
 
     async def on_member_update(self, before, after):
-        """Khi thành viên thay đổi role ở server nguồn, kích hoạt kiểm tra ngay."""
         if after.guild.id == self.cfg["source_guild_id"] and before.roles != after.roles:
             if self.enabled and self.cfg.get("sync_roles"):
                 try:
@@ -546,17 +537,15 @@ class Mirror(discord.Client):
             self.dirty.add(payload.channel_id)
 
     async def on_raw_message_delete(self, payload):
-        # Nếu xóa tin nhắn ở server nguồn -> Sửa tin nhắn bên server đích thành [ĐÃ XÓA]
         if payload.channel_id in self.selected:
             await self.mark_message_deleted(payload.channel_id, payload.message_id)
             return
 
-        # Nếu ai đó xóa nhầm tin nhắn bản sao ở server đích -> Tự động khôi phục lại
-        for cid, record in self.state["channels"].items():
+        for cid, record in self.state.get("channels", {}).items():
             if record.get("id") == payload.channel_id:
                 if record.get("voice_id") == payload.message_id:
                     record.pop("voice_text", None)
-                for mid, item in list(record["messages"].items()):
+                for mid, item in list(record.get("messages", {}).items()):
                     if item["id"] == payload.message_id:
                         del record["messages"][mid]
                 self.dirty.add(int(cid))
