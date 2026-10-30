@@ -1,4 +1,4 @@
-"""Bot đồng bộ 50 tin nhắn gần nhất, hình ảnh/video, theo dõi role và tự làm trống state.json sau khi chạy."""
+"""Bot đồng bộ 50 tin nhắn gần nhất, hình ảnh/video, theo dõi role và tự làm sạch bộ nhớ đệm."""
 import asyncio
 import io
 import json
@@ -318,6 +318,10 @@ class Mirror(discord.Client):
     async def destination(self, src):
         guild = self.get_guild(self.cfg["target_guild_id"])
         key = str(src.id)
+        
+        self.state.setdefault("channels", {})
+        self.state.setdefault("categories", {})
+        
         record = self.state["channels"].setdefault(key, {"messages": {}})
         dst = guild.get_channel(record.get("id", 0))
         if dst:
@@ -340,7 +344,7 @@ class Mirror(discord.Client):
         return dst, record
 
     async def mark_message_deleted(self, src_cid, mid):
-        record = self.state["channels"].get(str(src_cid))
+        record = self.state.get("channels", {}).get(str(src_cid))
         if not record:
             return
         mapping = record.get("messages", {})
@@ -439,10 +443,10 @@ class Mirror(discord.Client):
             self.save()
             await asyncio.sleep(0.3)
 
-        # Làm trống file state.json sau khi đồng bộ xong kênh này
-        self.state = {}
+        # Dọn sạch dữ liệu tin nhắn tạm trong record nhưng giữ nguyên cấu trúc kênh
+        record["messages"] = {}
         self.save()
-        LOG.info("Đã đồng bộ xong 50 tin cho kênh %s và làm trống state.json.", src.name)
+        LOG.info("Đã đồng bộ xong 50 tin cho kênh %s và dọn sạch bộ nhớ đệm tin nhắn.", src.name)
 
     async def sync_voice(self, src, dst, record):
         lines = [f"@{m.name} · {m.display_name}" for m in sorted(src.members, key=lambda m: m.id)]
