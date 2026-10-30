@@ -1,0 +1,8 @@
+{
+  "source_guild_id": 1391880304901226718,
+  "target_guild_id": 1565748861778002103,
+  "source_channel_ids": [],
+  "auto_discover_channels": true,
+  "sync_roles": true,
+  "target_viewer_role_ids": []
+}
