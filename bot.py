@@ -1,9 +1,10 @@
-"""Bot đồng bộ 50 tin nhắn gần nhất (kèm hình ảnh, video) từ server nguồn sang server đích."""
+"""Bot đồng bộ 50 tin nhắn (giữ lại tin đã xóa), hình ảnh/video và theo dõi biến động Role mỗi 5s."""
 import asyncio
 import io
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -47,21 +48,27 @@ def message_payload(msg):
     }
 
 
-def render_message(payload, source_id, fallback_links=None):
+def render_message(payload, source_id, fallback_links=None, deleted=False):
     has_media = bool(payload["attachments"] or payload["stickers"])
     body = payload["content"] or ("*(Đính kèm tệp / phương tiện)*" if has_media else "*(Không có nội dung chữ)*")
-    embed = discord.Embed(description=body[:4096], colour=0x5865F2)
+    if deleted:
+        body = f"**[ĐÃ XÓA Ở SERVER NGUỒN]**\n{body}"
+    colour = 0xED4245 if deleted else 0x5865F2
+
+    embed = discord.Embed(description=body[:4096], colour=colour)
+    author_prefix = "[ĐÃ XÓA] " if deleted else ""
     embed.set_author(
-        name=f'@{payload["username"]} · {payload["display_name"]}'[:256],
+        name=f'{author_prefix}@{payload["username"]} · {payload["display_name"]}'[:256],
         icon_url=payload["avatar"],
     )
-    embed.set_footer(text=f"Bản sao • ID nguồn: {source_id} • {payload['created_at']}")
+    status_text = "Đã xóa ở nguồn" if deleted else "Bản sao"
+    embed.set_footer(text=f"{status_text} • ID nguồn: {source_id} • {payload['created_at']}")
 
     extra = []
     if payload["reply_to"]:
         extra.append(f'Trả lời tin ID {payload["reply_to"]}')
     if fallback_links:
-        extra += [f'{a["name"]} (quá dung lượng/lỗi tải): {a["url"]}' for a in fallback_links]
+        extra += [f'{a["name"]} (link gốc): {a["url"]}' for a in fallback_links]
     extra += payload["stickers"]
 
     if extra:
@@ -123,7 +130,12 @@ class Mirror(discord.Client):
         self.cfg = cfg
         self.selected = set(cfg.get("source_channel_ids", []))
         path = ROOT / "state.json"
-        self.state = json.loads(path.read_text("utf-8")) if path.exists() else {}
+        try:
+            content = path.read_text("utf-8").strip() if path.exists() else ""
+            self.state = json.loads(content) if content else {}
+        except json.JSONDecodeError:
+            self.state = {}
+
         scope = [cfg["source_guild_id"], cfg["target_guild_id"]]
         if self.state and self.state.get("scope") != scope:
             raise ValueError("state.json thuộc cặp server khác. Hãy xóa file state.json cũ hoặc dùng thư mục riêng.")
@@ -133,6 +145,7 @@ class Mirror(discord.Client):
         self.dirty = set(self.selected)
         self.enabled = False
         self.tick = 0
+        self.role_lock = asyncio.Lock()
 
     def save(self):
         temp = ROOT / "state.tmp"
@@ -141,6 +154,7 @@ class Mirror(discord.Client):
 
     async def setup_hook(self):
         self.worker.start()
+        self.role_worker.start()
 
     async def on_ready(self):
         self.enabled = False
@@ -194,51 +208,117 @@ class Mirror(discord.Client):
         self.dirty.update(found - self.selected)
         self.selected = found
 
-    async def sync_role_roster(self, source):
-        target = self.get_guild(self.cfg["target_guild_id"])
+    async def get_role_log_channel(self, target):
         roster = self.state.setdefault("roster", {"pages": []})
-        channel = target.get_channel(roster.get("channel_id", 0))
-        if channel is None:
-            channel = await target.create_text_channel(
-                "danh-sach-role", overwrites=self.overwrites,
-                topic="Thành viên nguồn, nhóm theo role cao nhất. Tự động cập nhật.")
-            roster.update(channel_id=channel.id, pages=[])
+        log_ch = target.get_channel(roster.get("log_channel_id", 0))
+        if log_ch is None:
+            log_ch = await target.create_text_channel(
+                "update-role", overwrites=self.overwrites,
+                topic="Lịch sử thêm và mất role của thành viên bên server nguồn.")
+            roster["log_channel_id"] = log_ch.id
             self.save()
-        pages = role_pages(source)
-        for index, text in enumerate(pages):
-            old = roster["pages"][index] if index < len(roster["pages"]) else None
-            if old and old["text"] == text:
-                continue
-            result = None
-            if old:
+        return log_ch
+
+    async def sync_role_roster(self, source):
+        async with self.role_lock:
+            target = self.get_guild(self.cfg["target_guild_id"])
+            if not target:
+                return
+            roster = self.state.setdefault("roster", {"pages": []})
+
+            # 1. Đảm bảo kênh #danh-sach-role và #update-role tồn tại
+            channel = target.get_channel(roster.get("channel_id", 0))
+            if channel is None:
+                channel = await target.create_text_channel(
+                    "danh-sach-role", overwrites=self.overwrites,
+                    topic="Thành viên nguồn, nhóm theo role cao nhất. Tự động cập nhật mỗi 5s.")
+                roster.update(channel_id=channel.id, pages=[])
+                self.save()
+
+            log_channel = await self.get_role_log_channel(target)
+
+            # 2. Cập nhật bảng tổng hợp #danh-sach-role
+            pages = role_pages(source)
+            for index, text in enumerate(pages):
+                old = roster["pages"][index] if index < len(roster["pages"]) else None
+                if old and old["text"] == text:
+                    continue
+                result = None
+                if old:
+                    try:
+                        result = await channel.get_partial_message(old["id"]).edit(content=text)
+                    except discord.NotFound:
+                        pass
+                if result is None:
+                    result = await channel.send(text, silent=True)
+                entry = {"id": result.id, "text": text}
+                if old:
+                    roster["pages"][index] = entry
+                else:
+                    roster["pages"].append(entry)
+                self.save()
+
+            while len(roster["pages"]) > len(pages):
+                old = roster["pages"][-1]
                 try:
-                    result = await channel.get_partial_message(old["id"]).edit(content=text)
+                    await channel.get_partial_message(old["id"]).delete()
                 except discord.NotFound:
                     pass
-            if result is None:
-                result = await channel.send(text, silent=True)
-            entry = {"id": result.id, "text": text}
-            if old:
-                roster["pages"][index] = entry
-            else:
-                roster["pages"].append(entry)
-            self.save()
-        while len(roster["pages"]) > len(pages):
-            old = roster["pages"][-1]
-            try:
-                await channel.get_partial_message(old["id"]).delete()
-            except discord.NotFound:
-                pass
-            roster["pages"].pop()
-            self.save()
-        snapshot = [{"id": member.id, "username": member.name,
-                     "display_name": member.display_name,
-                     "top_role_id": member.top_role.id,
-                     "roles": [{"id": role.id, "name": role.name} for role in member.roles]}
-                    for member in sorted(source.members, key=lambda x: x.id)]
-        if roster.get("members") != snapshot:
-            roster["members"] = snapshot
-            self.save()
+                roster["pages"].pop()
+                self.save()
+
+            # 3. Kiểm tra ai được thêm role hoặc mất role để báo vào #update-role
+            old_members = {m["id"]: m for m in roster.get("members", [])}
+            snapshot = []
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            for member in sorted(source.members, key=lambda x: x.id):
+                roles_data = [
+                    {"id": role.id, "name": role.name}
+                    for role in member.roles
+                    if role != source.default_role
+                ]
+                snapshot.append({
+                    "id": member.id,
+                    "username": member.name,
+                    "display_name": member.display_name,
+                    "top_role_id": member.top_role.id,
+                    "roles": roles_data,
+                })
+
+                # Nếu đã có dữ liệu từ lần quét trước thì so sánh sự thay đổi
+                if old_members and member.id in old_members:
+                    old_r = {
+                        r["id"]: r["name"]
+                        for r in old_members[member.id].get("roles", [])
+                        if r["id"] != source.default_role.id
+                    }
+                    new_r = {r["id"]: r["name"] for r in roles_data}
+
+                    added_ids = set(new_r.keys()) - set(old_r.keys())
+                    removed_ids = set(old_r.keys()) - set(new_r.keys())
+
+                    if added_ids or removed_ids:
+                        embed = discord.Embed(
+                            title="Cập nhật Role thành viên",
+                            colour=0x57F287 if added_ids and not removed_ids else (0xED4245 if removed_ids and not added_ids else 0xFEE75C),
+                        )
+                        embed.set_author(
+                            name=f"@{member.name} · {member.display_name} (ID: {member.id})",
+                            icon_url=str(member.display_avatar.url),
+                        )
+                        if added_ids:
+                            added_names = ", ".join(f"**{new_r[rid]}**" for rid in added_ids)
+                            embed.add_field(name="➕ Được thêm Role", value=added_names[:1024], inline=False)
+                        if removed_ids:
+                            removed_names = ", ".join(f"**{old_r[rid]}**" for rid in removed_ids)
+                            embed.add_field(name="➖ Bị mất Role", value=removed_names[:1024], inline=False)
+                        embed.set_footer(text=f"Thời gian: {now_str}")
+                        await log_channel.send(embed=embed, silent=True)
+
+            if roster.get("members") != snapshot:
+                roster["members"] = snapshot
+                self.save()
 
     async def destination(self, src):
         guild = self.get_guild(self.cfg["target_guild_id"])
@@ -264,34 +344,86 @@ class Mirror(discord.Client):
         self.save()
         return dst, record
 
+    async def mark_message_deleted(self, src_cid, mid):
+        """Sửa tin nhắn ở server đích thành [ĐÃ XÓA] khi bị xóa ở server nguồn."""
+        record = self.state["channels"].get(str(src_cid))
+        if not record:
+            return
+        mapping = record.get("messages", {})
+        item = mapping.get(str(mid))
+        if not item or item.get("deleted"):
+            return
+
+        target = self.get_guild(self.cfg["target_guild_id"])
+        if not target:
+            return
+        dst = target.get_channel(record.get("id", 0))
+        if not dst:
+            return
+
+        item["deleted"] = True
+        embed = render_message(
+            item["payload"],
+            str(mid),
+            fallback_links=item.get("fallback_links"),
+            deleted=True,
+        )
+        try:
+            await dst.get_partial_message(item["id"]).edit(embed=embed)
+        except discord.NotFound:
+            pass
+        self.save()
+
     async def sync_messages(self, src, dst, record):
-        # Chỉ lấy 50 tin nhắn gần nhất của kênh nguồn
         recent = [m async for m in src.history(limit=LIMIT)]
         keep = {str(m.id) for m in recent}
         mapping = record["messages"]
         max_bytes = getattr(dst.guild, "filesize_limit", 25 * 1024 * 1024)
 
-        # Xóa các tin nhắn cũ nằm ngoài danh sách 50 tin mới nhất (hoặc đã bị xóa ở nguồn)
+        # Tin nhắn cổ nhất trong 50 tin hiện tại của kênh nguồn
+        oldest_recent_id = min((m.id for m in recent), default=0)
+
         for mid in list(mapping):
             if mid not in keep:
-                try:
-                    await dst.get_partial_message(mapping[mid]["id"]).delete()
-                except discord.NotFound:
-                    pass
-                mapping.pop(mid, None)
-                self.save()
+                item = mapping[mid]
+                # Nếu tin nhắn có ID lớn hơn tin thứ 50 (tức là tin mới bị thành viên xóa ở nguồn) -> Sửa thành [ĐÃ XÓA]
+                if int(mid) > oldest_recent_id:
+                    if not item.get("deleted"):
+                        item["deleted"] = True
+                        embed = render_message(
+                            item["payload"],
+                            mid,
+                            fallback_links=item.get("fallback_links"),
+                            deleted=True,
+                        )
+                        try:
+                            await dst.get_partial_message(item["id"]).edit(embed=embed)
+                            await asyncio.sleep(0.4)
+                        except discord.NotFound:
+                            mapping.pop(mid, None)
+                        self.save()
+                else:
+                    # Nếu tin nhắn đã cũ và trôi ra ngoài mốc 50 tin gần nhất -> Xóa cuốn chiếu để giữ đúng 50 tin
+                    try:
+                        await dst.get_partial_message(item["id"]).delete()
+                        await asyncio.sleep(0.6)
+                    except discord.NotFound:
+                        pass
+                    mapping.pop(mid, None)
+                    self.save()
 
         # Duyệt từ tin cũ đến tin mới trong phạm vi 50 tin nhắn gần nhất
         for msg in reversed(recent):
             mid = str(msg.id)
             payload = message_payload(msg)
             existing = mapping.get(mid)
-            if existing and existing["payload"] == payload:
+            if existing and existing["payload"] == payload and not existing.get("deleted"):
                 continue
 
             result = None
+            fallback_links = existing.get("fallback_links", []) if existing else []
             if existing:
-                embed = render_message(payload, mid)
+                embed = render_message(payload, mid, fallback_links=fallback_links, deleted=False)
                 try:
                     result = await dst.get_partial_message(existing["id"]).edit(embed=embed)
                 except discord.NotFound:
@@ -299,16 +431,21 @@ class Mirror(discord.Client):
 
             if result is None:
                 files, fallback_links = await prepare_attachments(msg, max_bytes)
-                embed = render_message(payload, mid, fallback_links=fallback_links)
+                embed = render_message(payload, mid, fallback_links=fallback_links, deleted=False)
                 try:
                     result = await dst.send(embed=embed, files=files, silent=True)
                 except discord.HTTPException as exc:
                     LOG.warning("Upload file lỗi ở tin %s (%s), chuyển sang gửi link dự phòng.", mid, exc)
-                    all_links = [{"name": a.filename, "url": a.url} for a in msg.attachments]
-                    embed = render_message(payload, mid, fallback_links=all_links)
+                    fallback_links = [{"name": a.filename, "url": a.url} for a in msg.attachments]
+                    embed = render_message(payload, mid, fallback_links=fallback_links, deleted=False)
                     result = await dst.send(embed=embed, silent=True)
 
-            mapping[mid] = {"id": result.id, "payload": payload}
+            mapping[mid] = {
+                "id": result.id,
+                "payload": payload,
+                "fallback_links": fallback_links,
+                "deleted": False,
+            }
             self.save()
             await asyncio.sleep(0.3)
 
@@ -335,6 +472,25 @@ class Mirror(discord.Client):
         record.update(voice_id=result.id, voice_text=full)
         self.save()
 
+    @tasks.loop(seconds=5)
+    async def role_worker(self):
+        """Vòng lặp cập nhật vai trò và kiểm tra thêm/mất role mỗi 5 giây."""
+        if not self.enabled or not self.is_ready():
+            return
+        if not self.cfg.get("sync_roles"):
+            return
+        source = self.get_guild(self.cfg["source_guild_id"])
+        if source is None:
+            return
+        try:
+            await self.sync_role_roster(source)
+        except discord.HTTPException as exc:
+            LOG.warning("Không cập nhật được bảng role: %s; sẽ thử lại.", exc)
+
+    @role_worker.before_loop
+    async def before_role_worker(self):
+        await self.wait_until_ready()
+
     @tasks.loop(seconds=3)
     async def worker(self):
         if not self.enabled or not self.is_ready():
@@ -346,11 +502,6 @@ class Mirror(discord.Client):
         if source is None:
             return
         self.discover(source)
-        if self.cfg.get("sync_roles"):
-            try:
-                await self.sync_role_roster(source)
-            except discord.HTTPException as exc:
-                LOG.warning("Không cập nhật được bảng role: %s; sẽ thử lại.", exc)
         pending = self.dirty.copy()
         self.dirty.difference_update(pending)
         for cid in pending & self.selected:
@@ -370,17 +521,37 @@ class Mirror(discord.Client):
     async def before_worker(self):
         await self.wait_until_ready()
 
+    async def on_interaction(self, interaction):
+        """Chặn hoàn toàn mọi tương tác Slash Command (/help, v.v.), không bao giờ phản hồi."""
+        return
+
     async def on_message(self, message):
+        """Không xử lý bất kỳ lệnh tiền tố nào (!help, +help, v.v.), chỉ ghi nhận có tin nhắn mới."""
+        if not message.guild or message.guild.id != self.cfg["source_guild_id"]:
+            return
         if message.channel.id in self.selected:
             self.dirty.add(message.channel.id)
+
+    async def on_member_update(self, before, after):
+        """Khi thành viên thay đổi role ở server nguồn, kích hoạt kiểm tra ngay."""
+        if after.guild.id == self.cfg["source_guild_id"] and before.roles != after.roles:
+            if self.enabled and self.cfg.get("sync_roles"):
+                try:
+                    await self.sync_role_roster(after.guild)
+                except discord.HTTPException:
+                    pass
 
     async def on_raw_message_edit(self, payload):
         if payload.channel_id in self.selected:
             self.dirty.add(payload.channel_id)
 
     async def on_raw_message_delete(self, payload):
+        # Nếu xóa tin nhắn ở server nguồn -> Sửa tin nhắn bên server đích thành [ĐÃ XÓA]
         if payload.channel_id in self.selected:
-            self.dirty.add(payload.channel_id)
+            await self.mark_message_deleted(payload.channel_id, payload.message_id)
+            return
+
+        # Nếu ai đó xóa nhầm tin nhắn bản sao ở server đích -> Tự động khôi phục lại
         for cid, record in self.state["channels"].items():
             if record.get("id") == payload.channel_id:
                 if record.get("voice_id") == payload.message_id:
@@ -393,7 +564,8 @@ class Mirror(discord.Client):
 
     async def on_raw_bulk_message_delete(self, payload):
         if payload.channel_id in self.selected:
-            self.dirty.add(payload.channel_id)
+            for mid in payload.message_ids:
+                await self.mark_message_deleted(payload.channel_id, mid)
 
     async def on_voice_state_update(self, member, before, after):
         for channel in (before.channel, after.channel):
