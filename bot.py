@@ -1,4 +1,4 @@
-"""Bot đồng bộ 50 tin nhắn gần nhất, hình ảnh/video, theo dõi role và tự làm sạch bộ nhớ đệm."""
+"""Bot đồng bộ 50 tin ban đầu, tự dọn bộ nhớ, đánh dấu đã sao chép và chỉ cập nhật tin nhắn mới."""
 import asyncio
 import io
 import json
@@ -136,9 +136,11 @@ class Mirror(discord.Client):
             self.state = {}
 
         scope = [cfg["source_guild_id"], cfg["target_guild_id"]]
-        if self.state and self.state.get("scope") != scope:
-            raise ValueError("state.json thuộc cặp server khác. Hãy xóa file state.json cũ hoặc dùng thư mục riêng.")
-        self.state.setdefault("scope", scope)
+        if self.state and self.state.get("scope") and self.state.get("scope") != scope:
+            LOG.warning("Phát hiện state.json của cặp server cũ, tự động làm mới.")
+            self.state = {}
+
+        self.state["scope"] = scope
         self.state.setdefault("channels", {})
         self.state.setdefault("categories", {})
         self.dirty = set(self.selected)
@@ -318,11 +320,17 @@ class Mirror(discord.Client):
     async def destination(self, src):
         guild = self.get_guild(self.cfg["target_guild_id"])
         key = str(src.id)
-        
+
         self.state.setdefault("channels", {})
         self.state.setdefault("categories", {})
-        
-        record = self.state["channels"].setdefault(key, {"messages": {}})
+
+        record = self.state["channels"].setdefault(
+            key, {"id": 0, "initial_done": False, "last_synced_id": 0, "messages": {}}
+        )
+        record.setdefault("messages", {})
+        record.setdefault("initial_done", False)
+        record.setdefault("last_synced_id", 0)
+
         dst = guild.get_channel(record.get("id", 0))
         if dst:
             return dst, record
@@ -337,7 +345,7 @@ class Mirror(discord.Client):
         create = guild.create_voice_channel if isinstance(src, discord.VoiceChannel) else guild.create_text_channel
         dst = await create(src.name, category=category, overwrites=self.overwrites,
                            reason="Đồng bộ 50 tin nhắn gần nhất từ server nguồn")
-        record.update(id=dst.id, messages={})
+        record.update(id=dst.id, initial_done=False, last_synced_id=0, messages={})
         record.pop("voice_id", None)
         record.pop("voice_text", None)
         self.save()
@@ -373,13 +381,43 @@ class Mirror(discord.Client):
         self.save()
 
     async def sync_messages(self, src, dst, record):
+        max_bytes = getattr(dst.guild, "filesize_limit", 25 * 1024 * 1024)
+        mapping = record.setdefault("messages", {})
+
+        # TRƯỜNG HỢP 1: Kênh chưa sao lưu lần đầu -> Sao chép 50 tin gần nhất rồi xóa data, đánh dấu hoàn tất
+        if not record.get("initial_done"):
+            recent = [m async for m in src.history(limit=LIMIT)]
+            latest_id = max((m.id for m in recent), default=0)
+
+            for msg in reversed(recent):
+                mid = str(msg.id)
+                payload = message_payload(msg)
+                files, fallback_links = await prepare_attachments(msg, max_bytes)
+                embed = render_message(payload, mid, fallback_links=fallback_links, deleted=False)
+                try:
+                    await dst.send(embed=embed, files=files, silent=True)
+                except discord.HTTPException as exc:
+                    LOG.warning("Upload file lỗi ở tin %s (%s), chuyển sang gửi link dự phòng.", mid, exc)
+                    fallback_links = [{"name": a.filename, "url": a.url} for a in msg.attachments]
+                    embed = render_message(payload, mid, fallback_links=fallback_links, deleted=False)
+                    await dst.send(embed=embed, silent=True)
+                await asyncio.sleep(0.35)
+
+            # Xóa sạch dữ liệu tin nhắn vừa chép, chỉ lưu trạng thái đã sao chép và ID mốc cuối cùng
+            record["messages"] = {}
+            record["initial_done"] = True
+            record["last_synced_id"] = latest_id
+            self.save()
+            LOG.info("Đã sao lưu xong 50 tin ban đầu cho kênh %s, xóa bộ nhớ đệm và chỉ chờ tin mới.", src.name)
+            return
+
+        # TRƯỜNG HỢP 2: Kênh đã sao lưu xong -> Chỉ cập nhật các tin nhắn mới phát sinh sau last_synced_id
+        last_id = record.get("last_synced_id", 0)
         recent = [m async for m in src.history(limit=LIMIT)]
         keep = {str(m.id) for m in recent}
-        mapping = record["messages"]
-        max_bytes = getattr(dst.guild, "filesize_limit", 25 * 1024 * 1024)
-
         oldest_recent_id = min((m.id for m in recent), default=0)
 
+        # Kiểm tra các tin nhắn mới đang được theo dõi nếu bị xóa ở nguồn
         for mid in list(mapping):
             if mid not in keep:
                 item = mapping[mid]
@@ -396,19 +434,21 @@ class Mirror(discord.Client):
                             await dst.get_partial_message(item["id"]).edit(embed=embed)
                             await asyncio.sleep(0.4)
                         except discord.NotFound:
-                            mapping.pop(mid, None)
+                            pass
+                        # Sau khi đánh dấu đã xóa xong thì dọn khỏi bộ nhớ luôn
+                        mapping.pop(mid, None)
                         self.save()
                 else:
-                    try:
-                        await dst.get_partial_message(item["id"]).delete()
-                        await asyncio.sleep(0.6)
-                    except discord.NotFound:
-                        pass
                     mapping.pop(mid, None)
                     self.save()
 
+        new_latest_id = last_id
         for msg in reversed(recent):
             mid = str(msg.id)
+            # Bỏ qua hoàn toàn các tin nhắn cũ đã được sao chép trước đó
+            if msg.id <= last_id and mid not in mapping:
+                continue
+
             payload = message_payload(msg)
             existing = mapping.get(mid)
             if existing and existing["payload"] == payload and not existing.get("deleted"):
@@ -434,19 +474,23 @@ class Mirror(discord.Client):
                     embed = render_message(payload, mid, fallback_links=fallback_links, deleted=False)
                     result = await dst.send(embed=embed, silent=True)
 
+            if msg.id > new_latest_id:
+                new_latest_id = msg.id
+
+            # Lưu tạm tối đa 15 tin nhắn mới nhất để bắt sự kiện chỉnh sửa/xóa, tự động xóa bớt tin cũ hơn cho nhẹ file
             mapping[mid] = {
                 "id": result.id,
                 "payload": payload,
                 "fallback_links": fallback_links,
                 "deleted": False,
             }
+            while len(mapping) > 15:
+                oldest_key = min(mapping.keys(), key=lambda k: int(k))
+                mapping.pop(oldest_key, None)
+
+            record["last_synced_id"] = new_latest_id
             self.save()
             await asyncio.sleep(0.3)
-
-        # Dọn sạch dữ liệu tin nhắn tạm trong record nhưng giữ nguyên cấu trúc kênh
-        record["messages"] = {}
-        self.save()
-        LOG.info("Đã đồng bộ xong 50 tin cho kênh %s và dọn sạch bộ nhớ đệm tin nhắn.", src.name)
 
     async def sync_voice(self, src, dst, record):
         lines = [f"@{m.name} · {m.display_name}" for m in sorted(src.members, key=lambda m: m.id)]
@@ -543,17 +587,6 @@ class Mirror(discord.Client):
     async def on_raw_message_delete(self, payload):
         if payload.channel_id in self.selected:
             await self.mark_message_deleted(payload.channel_id, payload.message_id)
-            return
-
-        for cid, record in self.state.get("channels", {}).items():
-            if record.get("id") == payload.channel_id:
-                if record.get("voice_id") == payload.message_id:
-                    record.pop("voice_text", None)
-                for mid, item in list(record.get("messages", {}).items()):
-                    if item["id"] == payload.message_id:
-                        del record["messages"][mid]
-                self.dirty.add(int(cid))
-                self.save()
 
     async def on_raw_bulk_message_delete(self, payload):
         if payload.channel_id in self.selected:
